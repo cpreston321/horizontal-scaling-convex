@@ -26,7 +26,7 @@ export const s3Example = action(async () => {
 });
 
 export const stripeExample = action(async () => {
-  const stripe = Stripe("sk_test_4eC39HqLyjWDarjtT1zdp7dc");
+  const stripe = Stripe("sk_test_PLACEHOLDER_TEST_KEY");
   const product = await stripe.products.create({
     name: "Gold Special",
   });

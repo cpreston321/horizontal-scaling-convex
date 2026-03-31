@@ -167,7 +167,7 @@ pub struct WorkOSAPIKeyResponse {
     pub id: String,
     pub name: String,
     pub expires_at: Option<String>,
-    /// like 'sk_test_a2V5XzAxSzVESlpWR1E0Sk01OFlTM1ZDNUM1UUQzLEIzZkcxNkVxR0swanZVQUZaTXN4VmNWTng'
+    /// like 'sk_test_PLACEHOLDER_TEST_KEY'
     pub value: String,
     pub created_at: String,
     pub updated_at: String,

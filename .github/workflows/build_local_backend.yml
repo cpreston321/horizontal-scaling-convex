@@ -16,7 +16,7 @@ env:
 jobs:
   build_and_test:
     name: Build and Test Convex Backend
-    runs-on: [self-hosted, aws, x64, xlarge]
+    runs-on: ubuntu-latest-16-cores
 
     services:
       # Label used to access service container
@@ -67,10 +67,7 @@ jobs:
         run: cargo update -w --locked
 
       - name: Cache pnpm artifacts
-        uses: runs-on/cache@v4
-        env:
-          AWS_REGION: ${{ vars.AWS_REGION }}
-          RUNS_ON_S3_BUCKET_CACHE: ${{ vars.RUNS_ON_S3_BUCKET_CACHE }}
+        uses: actions/cache@v4
         with:
           path: |
             npm-packages/common/temp/build-cache
