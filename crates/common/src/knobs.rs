@@ -1628,3 +1628,9 @@ pub static ENV_VAR_LIMIT: LazyLock<usize> = LazyLock::new(|| env_config("ENV_VAR
 /// If set, disable the /metrics endpoint
 pub static DISABLE_METRICS_ENDPOINT: LazyLock<bool> =
     LazyLock::new(|| env_config("DISABLE_METRICS_ENDPOINT", false));
+
+/// How often a partitioned node re-checks the authoritative replicated
+/// placement record for a newer version (issue #130). Lower values adopt
+/// placement changes faster; higher values reduce control-plane reads.
+pub static PLACEMENT_REFRESH_INTERVAL: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(env_config("PLACEMENT_REFRESH_INTERVAL_SECS", 5)));

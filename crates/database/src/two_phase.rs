@@ -655,6 +655,15 @@ impl NodeAddresses {
         Self { addresses }
     }
 
+    /// Build from an explicit partition → addresses map.
+    ///
+    /// Used by the replicated placement source (issue #130) so cluster
+    /// membership can be carried in the placement record rather than only in
+    /// the `NODE_ADDRESSES` env string.
+    pub fn from_map(addresses: BTreeMap<PartitionId, Vec<String>>) -> Self {
+        Self { addresses }
+    }
+
     /// Get the gRPC address for a partition.
     pub fn address_for(&self, partition: PartitionId) -> Option<&str> {
         self.addresses
@@ -671,6 +680,12 @@ impl NodeAddresses {
     /// Get all known partitions.
     pub fn partitions(&self) -> Vec<PartitionId> {
         self.addresses.keys().copied().collect()
+    }
+
+    /// Clone the partition → addresses map, e.g. to seed replicated placement
+    /// membership from the static `NODE_ADDRESSES` env at bootstrap.
+    pub fn to_map(&self) -> BTreeMap<PartitionId, Vec<String>> {
+        self.addresses.clone()
     }
 }
 
