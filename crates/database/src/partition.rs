@@ -130,12 +130,22 @@ pub struct StaticPlacementConfig<'a> {
 ///
 /// This is the seam between the future replicated control-plane record and the
 /// existing `PartitionMap` used by commit, routing, and 2PC paths.
+///
+/// In addition to table ownership, the record carries cluster *membership*: the
+/// gRPC peer addresses for each partition. Carrying membership in the
+/// replicated record is what lets a new partition be introduced by publishing a
+/// new version rather than by hand-editing every node's `NODE_ADDRESSES` env
+/// (issue #130).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementMetadata {
     source: PlacementMetadataSource,
     version: PlacementVersion,
     num_partitions: u32,
     rules: BTreeMap<PlacementTarget, PartitionId>,
+    /// Partition → gRPC peer addresses. Empty when membership is supplied out
+    /// of band by the static `NODE_ADDRESSES` env (the bootstrap/fallback
+    /// path).
+    members: BTreeMap<PartitionId, Vec<String>>,
 }
 
 impl PlacementMetadata {
@@ -163,6 +173,7 @@ impl PlacementMetadata {
             version: config.placement_version,
             num_partitions: config.num_partitions,
             rules,
+            members: BTreeMap::new(),
         }
     }
 
@@ -179,6 +190,7 @@ impl PlacementMetadata {
                 .iter()
                 .map(|(table, owner)| (PlacementTarget::Table(table.clone()), *owner))
                 .collect(),
+            members: BTreeMap::new(),
         }
     }
 
@@ -196,11 +208,38 @@ impl PlacementMetadata {
                 .into_iter()
                 .map(|(table, owner)| (PlacementTarget::Table(table), owner))
                 .collect(),
+            members: BTreeMap::new(),
         }
+    }
+
+    /// Attach cluster membership (partition → gRPC peer addresses) to the
+    /// record.
+    ///
+    /// Blank addresses are dropped and partitions with no usable address are
+    /// omitted so a half-filled env string cannot register an unroutable
+    /// member.
+    pub fn with_members(mut self, members: BTreeMap<PartitionId, Vec<String>>) -> Self {
+        self.members = members
+            .into_iter()
+            .filter_map(|(partition, addresses)| {
+                let addresses: Vec<String> = addresses
+                    .into_iter()
+                    .map(|addr| addr.trim().to_string())
+                    .filter(|addr| !addr.is_empty())
+                    .collect();
+                (!addresses.is_empty()).then_some((partition, addresses))
+            })
+            .collect();
+        self
     }
 
     pub fn source(&self) -> PlacementMetadataSource {
         self.source
+    }
+
+    /// Cluster membership: partition → gRPC peer addresses.
+    pub fn members(&self) -> &BTreeMap<PartitionId, Vec<String>> {
+        &self.members
     }
 
     pub fn version(&self) -> PlacementVersion {
@@ -246,6 +285,10 @@ struct SerializedPlacementMetadata {
     version: u64,
     num_partitions: u32,
     table_assignments: BTreeMap<String, u32>,
+    /// Partition id (as string) → gRPC peer addresses. Defaulted so records
+    /// written before membership existed still decode.
+    #[serde(default)]
+    members: BTreeMap<String, Vec<String>>,
 }
 
 impl From<&PlacementMetadata> for SerializedPlacementMetadata {
@@ -257,6 +300,11 @@ impl From<&PlacementMetadata> for SerializedPlacementMetadata {
                 .table_assignments()
                 .into_iter()
                 .map(|(table, partition)| (table.to_string(), partition.0))
+                .collect(),
+            members: metadata
+                .members()
+                .iter()
+                .map(|(partition, addresses)| (partition.0.to_string(), addresses.clone()))
                 .collect(),
         }
     }
@@ -271,12 +319,25 @@ impl TryFrom<SerializedPlacementMetadata> for PlacementMetadata {
             .into_iter()
             .map(|(table, partition)| Ok((table.parse::<TableName>()?, PartitionId(partition))))
             .collect::<anyhow::Result<_>>()?;
+        let members = serialized
+            .members
+            .into_iter()
+            .map(|(partition, addresses)| {
+                Ok((
+                    PartitionId(partition.parse::<u32>().with_context(|| {
+                        format!("Placement metadata: invalid partition id {partition:?} in members")
+                    })?),
+                    addresses,
+                ))
+            })
+            .collect::<anyhow::Result<BTreeMap<PartitionId, Vec<String>>>>()?;
         Ok(PlacementMetadata::from_table_assignments(
             PlacementMetadataSource::Replicated,
             PlacementVersion::new(serialized.version),
             serialized.num_partitions,
             assignments,
-        ))
+        )
+        .with_members(members))
     }
 }
 
@@ -290,6 +351,15 @@ pub trait PlacementMetadataStore: Send + Sync + 'static {
         &self,
         bootstrap_metadata: PlacementMetadata,
     ) -> anyhow::Result<PlacementMetadata>;
+
+    /// Publish a new placement version to the authoritative replicated record.
+    ///
+    /// This is the control-plane entrypoint for add-node, remove-node, and
+    /// rebalance: an operator (or a future automated control plane) builds the
+    /// next `PlacementMetadata` and publishes it. The new version must be
+    /// strictly greater than the current one; the update is a compare-and-set
+    /// so two concurrent publishers cannot silently clobber each other.
+    async fn publish(&self, metadata: PlacementMetadata) -> anyhow::Result<PlacementMetadata>;
 }
 
 pub struct NatsPlacementMetadataStore {
@@ -360,6 +430,91 @@ impl PlacementMetadataStore for NatsPlacementMetadataStore {
                 .context("Placement metadata: current metadata missing after initialize race"),
         }
     }
+
+    async fn publish(&self, metadata: PlacementMetadata) -> anyhow::Result<PlacementMetadata> {
+        let payload = Self::encode(&metadata)?;
+        let entry = self
+            .kv
+            .entry(PLACEMENT_CURRENT_KEY)
+            .await
+            .context("Placement metadata: failed to read current metadata before publish")?;
+        match entry {
+            Some(entry) => {
+                let current = Self::decode(&entry.value)?;
+                anyhow::ensure!(
+                    metadata.version() > current.version(),
+                    "Refusing to publish placement version {} over current {}; the new version \
+                     must be strictly greater",
+                    metadata.version(),
+                    current.version(),
+                );
+                // Compare-and-set against the observed revision so a concurrent
+                // publisher fails instead of silently clobbering this update.
+                self.kv
+                    .update(PLACEMENT_CURRENT_KEY, payload.into(), entry.revision)
+                    .await
+                    .context(
+                        "Placement metadata: publish failed; another publisher likely raced this \
+                         update — reload and retry",
+                    )?;
+            },
+            None => {
+                self.kv
+                    .create(PLACEMENT_CURRENT_KEY, payload.into())
+                    .await
+                    .context("Placement metadata: failed to create initial published metadata")?;
+            },
+        }
+        self.load()
+            .await?
+            .context("Placement metadata: current metadata missing after publish")
+    }
+}
+
+/// A component that routes with placement metadata and can adopt a newer
+/// version at runtime.
+///
+/// Implemented by `PlacementState` (used directly in tests) and by the
+/// committer client (used in production). The refresh loop is written against
+/// this trait so its decision logic — "only install strictly newer versions" —
+/// can be exercised without a running committer.
+pub trait PlacementRefreshTarget: Send + Sync {
+    fn current_placement_version(&self) -> PlacementVersion;
+    fn install_placement_metadata(&self, metadata: PlacementMetadata) -> anyhow::Result<()>;
+}
+
+impl PlacementRefreshTarget for PlacementState {
+    fn current_placement_version(&self) -> PlacementVersion {
+        self.placement_version()
+    }
+
+    fn install_placement_metadata(&self, metadata: PlacementMetadata) -> anyhow::Result<()> {
+        self.refresh(metadata)
+    }
+}
+
+/// Load the authoritative placement record once and install it if it is newer
+/// than what the target is currently routing with.
+///
+/// Returns the version that was installed, or `None` when nothing changed
+/// (no record yet, or the record is not newer). This is the body of the
+/// background refresh loop and the unit under test for stale-version detection
+/// (issue #130, acceptance criterion 2). Equal versions are intentionally a
+/// no-op so an idle cluster does not churn the routing lock.
+pub async fn refresh_placement_once(
+    store: &dyn PlacementMetadataStore,
+    target: &dyn PlacementRefreshTarget,
+) -> anyhow::Result<Option<PlacementVersion>> {
+    let Some(latest) = store.load().await? else {
+        return Ok(None);
+    };
+    if latest.version() <= target.current_placement_version() {
+        return Ok(None);
+    }
+    let new_version = latest.version();
+    target.install_placement_metadata(latest)?;
+    crate::metrics::log_placement_metadata_refresh(new_version.into());
+    Ok(Some(new_version))
 }
 
 /// Refreshable placement state shared by routing components.
@@ -421,6 +576,22 @@ impl PlacementState {
             .read()
             .expect("placement metadata lock poisoned")
             .version()
+    }
+
+    /// Snapshot the cluster membership as `NodeAddresses` for 2PC routing.
+    ///
+    /// Returns `None` when the replicated record carries no membership, so the
+    /// caller can fall back to the static `NODE_ADDRESSES` env. The snapshot is
+    /// taken under the same lock as routing reads, so a concurrent placement
+    /// refresh cannot change addresses halfway through routing one transaction.
+    pub fn node_addresses(&self) -> Option<crate::two_phase::NodeAddresses> {
+        let members = self
+            .metadata
+            .read()
+            .expect("placement metadata lock poisoned")
+            .members()
+            .clone();
+        (!members.is_empty()).then(|| crate::two_phase::NodeAddresses::from_map(members))
     }
 
     pub fn local_partition(&self) -> PartitionId {
@@ -587,9 +758,73 @@ pub fn routed_partition_for_table(
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::{
+        Arc,
+        Mutex,
+    };
+
+    use async_trait::async_trait;
+
+    use super::{
+        PlacementMetadata,
+        PlacementMetadataStore,
+    };
+
+    /// In-memory `PlacementMetadataStore` for tests.
+    ///
+    /// Mirrors the NATS store's contract: `ensure_initialized` is
+    /// first-write-wins and `publish` requires a strictly greater version, so
+    /// the refresh loop and control-plane publish path can be exercised without
+    /// NATS.
+    #[derive(Clone, Default)]
+    pub struct InMemoryPlacementMetadataStore {
+        current: Arc<Mutex<Option<PlacementMetadata>>>,
+    }
+
+    impl InMemoryPlacementMetadataStore {
+        pub fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    #[async_trait]
+    impl PlacementMetadataStore for InMemoryPlacementMetadataStore {
+        async fn load(&self) -> anyhow::Result<Option<PlacementMetadata>> {
+            Ok(self.current.lock().unwrap().clone())
+        }
+
+        async fn ensure_initialized(
+            &self,
+            bootstrap_metadata: PlacementMetadata,
+        ) -> anyhow::Result<PlacementMetadata> {
+            let mut current = self.current.lock().unwrap();
+            Ok(current.get_or_insert(bootstrap_metadata).clone())
+        }
+
+        async fn publish(&self, metadata: PlacementMetadata) -> anyhow::Result<PlacementMetadata> {
+            let mut current = self.current.lock().unwrap();
+            if let Some(existing) = current.as_ref() {
+                anyhow::ensure!(
+                    metadata.version() > existing.version(),
+                    "Refusing to publish placement version {} over current {}",
+                    metadata.version(),
+                    existing.version(),
+                );
+            }
+            *current = Some(metadata.clone());
+            Ok(metadata)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        testing::InMemoryPlacementMetadataStore,
+        *,
+    };
     use crate::write_log::WriteSource;
 
     #[test]
@@ -822,6 +1057,189 @@ mod tests {
                 .get(&"projects".parse().unwrap()),
             Some(&PartitionId(1)),
         );
+        Ok(())
+    }
+
+    fn members(entries: &[(u32, &str)]) -> BTreeMap<PartitionId, Vec<String>> {
+        entries
+            .iter()
+            .map(|(partition, addr)| (PartitionId(*partition), vec![addr.to_string()]))
+            .collect()
+    }
+
+    #[test]
+    fn test_with_members_drops_blank_addresses() {
+        let metadata = PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: "messages=1",
+            num_partitions: 2,
+            placement_version: PlacementVersion::new(1),
+        })
+        .with_members(BTreeMap::from([
+            (PartitionId(0), vec!["  node-a:50051 ".to_string()]),
+            (PartitionId(1), vec!["".to_string(), "   ".to_string()]),
+        ]));
+
+        // Partition 0's address is trimmed; partition 1 had only blanks and is
+        // dropped so it cannot register as an unroutable member.
+        assert_eq!(
+            metadata.members().get(&PartitionId(0)),
+            Some(&vec!["node-a:50051".to_string()])
+        );
+        assert_eq!(metadata.members().get(&PartitionId(1)), None);
+    }
+
+    #[test]
+    fn test_placement_metadata_serialization_round_trips_members() -> anyhow::Result<()> {
+        let metadata = PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: "messages=0,projects=1",
+            num_partitions: 2,
+            placement_version: PlacementVersion::new(4),
+        })
+        .with_members(members(&[(0, "node-a:50051"), (1, "node-b:50051")]));
+
+        let bytes = NatsPlacementMetadataStore::encode(&metadata)?;
+        let decoded = NatsPlacementMetadataStore::decode(&bytes)?;
+
+        assert_eq!(decoded.members(), metadata.members());
+        Ok(())
+    }
+
+    #[test]
+    fn test_placement_metadata_decodes_legacy_record_without_members() -> anyhow::Result<()> {
+        // A record written before membership existed has no `members` field.
+        let legacy = br#"{"version":2,"numPartitions":2,"tableAssignments":{"messages":1}}"#;
+        let decoded = NatsPlacementMetadataStore::decode(legacy)?;
+
+        assert_eq!(decoded.version(), PlacementVersion::new(2));
+        assert!(decoded.members().is_empty());
+        assert_eq!(
+            decoded
+                .table_assignments()
+                .get(&"messages".parse().unwrap()),
+            Some(&PartitionId(1))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_placement_state_node_addresses_snapshot() -> anyhow::Result<()> {
+        let with_members = PlacementMetadata::from_static_config(StaticPlacementConfig {
+            table_assignments: "messages=1",
+            num_partitions: 2,
+            placement_version: PlacementVersion::new(1),
+        })
+        .with_members(members(&[(0, "node-a:50051"), (1, "node-b:50051")]));
+        let state = PlacementState::new(PartitionId(0), with_members)?;
+
+        let addresses = state
+            .node_addresses()
+            .expect("membership should yield node addresses");
+        assert_eq!(addresses.address_for(PartitionId(1)), Some("node-b:50051"));
+
+        // With no membership, the snapshot is None so callers fall back to env.
+        let no_members = PlacementState::new(
+            PartitionId(0),
+            PlacementMetadata::from_static_config(StaticPlacementConfig {
+                table_assignments: "messages=1",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(1),
+            }),
+        )?;
+        assert!(no_members.node_addresses().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_refresh_placement_once_installs_newer_version() -> anyhow::Result<()> {
+        let store = InMemoryPlacementMetadataStore::new();
+        store
+            .ensure_initialized(PlacementMetadata::from_static_config(
+                StaticPlacementConfig {
+                    table_assignments: "messages=0",
+                    num_partitions: 2,
+                    placement_version: PlacementVersion::new(1),
+                },
+            ))
+            .await?;
+        let state = PlacementState::new(
+            PartitionId(0),
+            PlacementMetadata::from_static_config(StaticPlacementConfig {
+                table_assignments: "messages=0",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(1),
+            }),
+        )?;
+
+        // Equal version is a no-op.
+        assert_eq!(refresh_placement_once(&store, &state).await?, None);
+
+        // Operator publishes a newer version moving `messages` to partition 1.
+        store
+            .publish(PlacementMetadata::from_static_config(
+                StaticPlacementConfig {
+                    table_assignments: "messages=1",
+                    num_partitions: 2,
+                    placement_version: PlacementVersion::new(2),
+                },
+            ))
+            .await?;
+
+        assert_eq!(
+            refresh_placement_once(&store, &state).await?,
+            Some(PlacementVersion::new(2))
+        );
+        assert_eq!(state.placement_version(), PlacementVersion::new(2));
+        assert_eq!(
+            state
+                .partition_map()
+                .partition_for_table(&"messages".parse().unwrap()),
+            PartitionId(1)
+        );
+
+        // A second refresh with nothing new is a no-op.
+        assert_eq!(refresh_placement_once(&store, &state).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_refresh_placement_once_no_record_is_noop() -> anyhow::Result<()> {
+        let store = InMemoryPlacementMetadataStore::new();
+        let state = PlacementState::new(
+            PartitionId(0),
+            PlacementMetadata::from_static_config(StaticPlacementConfig {
+                table_assignments: "messages=0",
+                num_partitions: 2,
+                placement_version: PlacementVersion::new(1),
+            }),
+        )?;
+        assert_eq!(refresh_placement_once(&store, &state).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_publish_rejects_non_increasing_version() -> anyhow::Result<()> {
+        let store = InMemoryPlacementMetadataStore::new();
+        store
+            .ensure_initialized(PlacementMetadata::from_static_config(
+                StaticPlacementConfig {
+                    table_assignments: "messages=0",
+                    num_partitions: 2,
+                    placement_version: PlacementVersion::new(5),
+                },
+            ))
+            .await?;
+
+        let err = store
+            .publish(PlacementMetadata::from_static_config(
+                StaticPlacementConfig {
+                    table_assignments: "messages=1",
+                    num_partitions: 2,
+                    placement_version: PlacementVersion::new(5),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Refusing to publish"));
         Ok(())
     }
 

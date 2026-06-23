@@ -476,7 +476,10 @@ pub async fn coordinate_two_phase_commit(
     };
 
     let participant_indexes = participant_write_indexes(&transaction, partition_map, &write_source);
-    let node_addresses = local_committer.node_addresses();
+    // Prefer membership from the replicated placement record so a newly added
+    // partition is routable without editing this node's env (issue #130).
+    let effective_node_addresses = local_committer.effective_node_addresses();
+    let node_addresses = effective_node_addresses.as_ref();
     let participants: Vec<_> = participant_indexes
         .iter()
         .map(|(participant, write_indexes)| -> anyhow::Result<_> {

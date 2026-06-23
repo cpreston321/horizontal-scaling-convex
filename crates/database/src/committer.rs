@@ -4766,6 +4766,19 @@ pub struct CommitterClient {
     two_phase_client_pool: Arc<crate::two_phase::TwoPhaseCommitGrpcClientPool>,
 }
 
+impl crate::partition::PlacementRefreshTarget for CommitterClient {
+    fn current_placement_version(&self) -> crate::partition::PlacementVersion {
+        self.placement_version()
+    }
+
+    fn install_placement_metadata(
+        &self,
+        metadata: crate::partition::PlacementMetadata,
+    ) -> anyhow::Result<()> {
+        self.refresh_placement_metadata(metadata)
+    }
+}
+
 impl CommitterClient {
     pub fn local_partition(&self) -> Option<crate::partition::PartitionId> {
         self.placement_state
@@ -4905,8 +4918,23 @@ impl CommitterClient {
         self.persistence_reader.clone()
     }
 
-    pub(crate) fn node_addresses(&self) -> Option<&crate::two_phase::NodeAddresses> {
-        self.node_addresses.as_ref()
+    /// Node addresses for 2PC routing, preferring the replicated placement
+    /// source over the static `NODE_ADDRESSES` env (issue #130).
+    ///
+    /// When the replicated record carries cluster membership, a newly added
+    /// partition becomes routable as soon as the placement refresh installs the
+    /// new version — no env edit or restart on existing nodes. The static env
+    /// remains the fallback while a deployment has not yet published
+    /// membership.
+    pub(crate) fn effective_node_addresses(&self) -> Option<crate::two_phase::NodeAddresses> {
+        if let Some(addresses) = self
+            .placement_state
+            .as_ref()
+            .and_then(|placement_state| placement_state.node_addresses())
+        {
+            return Some(addresses);
+        }
+        self.node_addresses.clone()
     }
 
     pub(crate) async fn two_phase_client(

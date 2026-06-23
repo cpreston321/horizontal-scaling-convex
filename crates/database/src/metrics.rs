@@ -326,6 +326,21 @@ pub fn log_selective_delivery_shadow_receive() {
 }
 
 register_convex_gauge!(
+    DATABASE_PLACEMENT_VERSION_INFO,
+    "Placement metadata version this node is currently routing with"
+);
+register_convex_counter!(
+    DATABASE_PLACEMENT_REFRESH_TOTAL,
+    "Number of times this node installed a newer placement metadata version at runtime"
+);
+/// Record a live placement-version refresh (issue #130): the node picked up a
+/// newer replicated placement map without a process restart.
+pub fn log_placement_metadata_refresh(new_version: u64) {
+    log_counter(&DATABASE_PLACEMENT_REFRESH_TOTAL, 1);
+    log_gauge(&DATABASE_PLACEMENT_VERSION_INFO, new_version as f64);
+}
+
+register_convex_gauge!(
     DATABASE_LATEST_REPEATABLE_TS_INFO,
     "Latest repeatable timestamp currently visible on this node"
 );

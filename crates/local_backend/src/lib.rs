@@ -37,6 +37,7 @@ use common::{
     knobs::{
         ACTION_USER_TIMEOUT,
         DOCUMENT_RETENTION_RATE_LIMIT,
+        PLACEMENT_REFRESH_INTERVAL,
         UDF_CACHE_MAX_SIZE,
     },
     persistence::Persistence,
@@ -442,7 +443,7 @@ pub async fn make_app(
     let static_placement_metadata = config.partition_id.map(|_| {
         let partition_map_str = config.partition_map.as_deref().unwrap_or("");
         let num_partitions = config.num_partitions.unwrap_or(1);
-        database::partition::PlacementMetadata::from_static_config(
+        let metadata = database::partition::PlacementMetadata::from_static_config(
             database::partition::StaticPlacementConfig {
                 table_assignments: partition_map_str,
                 num_partitions,
@@ -450,7 +451,16 @@ pub async fn make_app(
                     config.partition_map_version.unwrap_or_default(),
                 ),
             },
-        )
+        );
+        // Seed cluster membership from the static NODE_ADDRESSES env so the
+        // first node to initialize the replicated record publishes routable
+        // addresses for every partition (issue #130).
+        match config.node_addresses.as_deref() {
+            Some(node_addresses) => metadata.with_members(
+                database::two_phase::NodeAddresses::from_config(node_addresses).to_map(),
+            ),
+            None => metadata,
+        }
     });
 
     let database = Database::load(
@@ -496,6 +506,36 @@ pub async fn make_app(
             database
                 .committer_client()
                 .refresh_placement_metadata(authoritative_metadata)?;
+
+            // Watch the authoritative record for newer versions and adopt them
+            // without a process restart (issue #130, acceptance criterion 2).
+            // A new node or rebalance is rolled out by publishing a higher
+            // placement version; running nodes pick it up here.
+            let refresh_store = store.clone();
+            let refresh_committer = database.committer_client();
+            let refresh_runtime = runtime.clone();
+            runtime.spawn_background("placement_metadata_refresh", async move {
+                loop {
+                    refresh_runtime.wait(*PLACEMENT_REFRESH_INTERVAL).await;
+                    match database::partition::refresh_placement_once(
+                        refresh_store.as_ref(),
+                        &refresh_committer,
+                    )
+                    .await
+                    {
+                        Ok(Some(version)) => {
+                            tracing::info!(
+                                "Adopted newer placement metadata version {version} without \
+                                 restart"
+                            );
+                        },
+                        Ok(None) => {},
+                        Err(e) => {
+                            tracing::warn!("Placement metadata refresh failed: {e:#}");
+                        },
+                    }
+                }
+            });
             Some(store)
         } else {
             None
