@@ -1628,3 +1628,19 @@ pub static ENV_VAR_LIMIT: LazyLock<usize> = LazyLock::new(|| env_config("ENV_VAR
 /// If set, disable the /metrics endpoint
 pub static DISABLE_METRICS_ENDPOINT: LazyLock<bool> =
     LazyLock::new(|| env_config("DISABLE_METRICS_ENDPOINT", false));
+
+/// Whether a partitioned node may treat selective delivery (per-node interest
+/// targeting) as the *sole* delivery path for cross-partition user-table deltas
+/// (issue #133).
+///
+/// Default `false` (fail safe): the main replica consumer subscribes to the
+/// broadcast partition subjects, which deliver every delta regardless of
+/// interest. Selective node targeting remains a best-effort fanout-reduction
+/// shadow on top of that.
+///
+/// Set `true` only once distributed reactive invalidation (#132) proves that no
+/// node can miss an invalidation when its interest registration is stale,
+/// missing, or lost across a NATS reconnect. Until then, trusting interest can
+/// silently drop deltas and leave a node stale.
+pub static SELECTIVE_DELIVERY_TRUST_INTEREST: LazyLock<bool> =
+    LazyLock::new(|| env_config("SELECTIVE_DELIVERY_TRUST_INTEREST", false));

@@ -325,6 +325,55 @@ pub fn log_selective_delivery_shadow_receive() {
     log_counter(&DATABASE_SELECTIVE_DELIVERY_SHADOW_RECEIVES_TOTAL, 1);
 }
 
+register_convex_counter!(
+    DATABASE_SELECTIVE_DELIVERY_BROADCAST_DELTAS_TOTAL,
+    "User-table deltas published to the broadcast (correctness-critical) partition subject"
+);
+/// Record a delta published to the broadcast partition subject — the
+/// correctness-critical path that delivers to every node regardless of interest
+/// (issue #133).
+pub fn log_selective_delivery_broadcast_delta() {
+    log_counter(&DATABASE_SELECTIVE_DELIVERY_BROADCAST_DELTAS_TOTAL, 1);
+}
+
+register_convex_gauge!(
+    DATABASE_SELECTIVE_DELIVERY_STALE_REGISTRATIONS_INFO,
+    "Interest registrations skipped as stale when last evaluating a delta's interested nodes"
+);
+/// Record how many interest registrations were too old to trust on the most
+/// recent delivery decision. A nonzero value means selective delivery would
+/// under-deliver if it were the sole path — the broadcast fallback must remain.
+pub fn log_selective_delivery_stale_registrations(stale_nodes: usize) {
+    log_gauge(
+        &DATABASE_SELECTIVE_DELIVERY_STALE_REGISTRATIONS_INFO,
+        stale_nodes as f64,
+    );
+}
+
+register_convex_gauge!(
+    DATABASE_SELECTIVE_DELIVERY_INTEREST_HIT_RATE_INFO,
+    "Fraction of known node registrations that matched the last delta's tables (0.0-1.0)"
+);
+register_convex_counter!(
+    DATABASE_SELECTIVE_DELIVERY_BROADCAST_FALLBACKS_TOTAL,
+    "Deltas where no narrowing was possible because no node interest was known (full broadcast)"
+);
+/// Record the selective-delivery hit rate for one delivery decision and, when
+/// no interest is known at all, count it as a broadcast fallback (issue #133).
+pub fn log_selective_delivery_interest_hit(known_nodes: usize, interested_nodes: usize) {
+    if known_nodes == 0 {
+        // No interest known — the publisher cannot narrow, so this delta relies
+        // entirely on the broadcast path. Track it as a fallback rather than a
+        // 0% hit rate so the two cases stay distinguishable.
+        log_counter(&DATABASE_SELECTIVE_DELIVERY_BROADCAST_FALLBACKS_TOTAL, 1);
+        return;
+    }
+    log_gauge(
+        &DATABASE_SELECTIVE_DELIVERY_INTEREST_HIT_RATE_INFO,
+        interested_nodes as f64 / known_nodes as f64,
+    );
+}
+
 register_convex_gauge!(
     DATABASE_LATEST_REPEATABLE_TS_INFO,
     "Latest repeatable timestamp currently visible on this node"
