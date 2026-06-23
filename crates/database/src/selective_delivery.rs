@@ -1,3 +1,34 @@
+//! Selective delivery: best-effort fanout reduction for replication deltas.
+//!
+//! # Correctness boundary (issue #133)
+//!
+//! Selective delivery tracks, per node, which tables that node currently has
+//! live subscriptions for, so a publisher *can* send a user-table delta only to
+//! the nodes that care about it instead of broadcasting to everyone.
+//!
+//! This is strictly an **optimization**. It must never be the sole thing
+//! responsible for getting a delta to a node, because interest registrations
+//! are soft state: they expire ([`INTEREST_MAX_AGE`]), they are absent until a
+//! freshly started node first publishes them, and a publisher's cached view of
+//! them can lag or be lost across a NATS reconnect. If selective delivery were
+//! the only path, any of those would silently drop a delta a node needed for
+//! subscription invalidation or frontier correctness — fast, but wrong.
+//!
+//! The rules this module is built to uphold:
+//!
+//! - **Correctness-critical replication/invalidation rides the broadcast
+//!   partition subjects**, which deliver every delta regardless of interest.
+//!   That path is owned by `NatsDistributedLog`'s partition-subject publish and
+//!   the broadcast consumer, not by this registry.
+//! - **Uncertainty fails safe by over-delivering.** Absence or staleness of an
+//!   interest record means "deliver anyway", never "skip". Convex tolerates
+//!   conservative extra invalidations; it cannot tolerate a missed one.
+//! - This registry only ever *narrows* a delivery that the broadcast path
+//!   already guarantees. It is wired in behind
+//!   `SELECTIVE_DELIVERY_TRUST_INTEREST` (default off) so it cannot become a
+//!   node's only source of deltas until distributed reactive invalidation
+//!   (#132) proves that is safe.
+
 use std::{
     collections::{
         BTreeMap,
@@ -105,6 +136,27 @@ impl SelectiveDeliveryRegistry {
         interested_nodes_for_tables_from_cache(&self.cache.read(), now_ms(), tables)
     }
 
+    /// Like [`Self::interested_nodes_for_tables`], but also reports how many
+    /// node registrations were known and how many were skipped as stale,
+    /// and emits the selective-delivery health metrics (issue #133).
+    ///
+    /// The stale count is the signal that selective delivery is at risk of
+    /// under-delivering: a stale registration is one the publisher can no
+    /// longer trust, so the correctness-critical broadcast path must remain
+    /// in place.
+    pub fn interested_nodes_with_health(&self, tables: &BTreeSet<TableName>) -> InterestSelection {
+        let selection = {
+            let cache = self.cache.read();
+            interest_selection_from_cache(&cache, now_ms(), tables)
+        };
+        crate::metrics::log_selective_delivery_stale_registrations(selection.stale_nodes);
+        crate::metrics::log_selective_delivery_interest_hit(
+            selection.known_nodes,
+            selection.interested.len(),
+        );
+        selection
+    }
+
     pub fn node_subject(node_name: &str) -> String {
         format!("{NODE_SUBJECT_PREFIX}.{node_name}")
     }
@@ -175,6 +227,19 @@ impl SelectiveDeliveryRegistry {
     }
 }
 
+/// Result of evaluating which nodes a delta should be shadow-delivered to,
+/// along with the health counters used to reason about whether selective
+/// delivery is safely narrowing or at risk of under-delivering.
+#[derive(Clone, Debug)]
+pub struct InterestSelection {
+    /// Nodes with a fresh interest registration matching the touched tables.
+    pub interested: Vec<String>,
+    /// Total node registrations known to this publisher (fresh or stale).
+    pub known_nodes: usize,
+    /// Registrations skipped because they were older than [`INTEREST_MAX_AGE`].
+    pub stale_nodes: usize,
+}
+
 fn interested_nodes_for_tables_from_cache(
     cache: &BTreeMap<String, InterestRegistration>,
     now_ms: u64,
@@ -189,6 +254,21 @@ fn interested_nodes_for_tables_from_cache(
         .filter(|(_, registration)| registration.matches(tables))
         .map(|(node, _)| node.clone())
         .collect()
+}
+
+fn interest_selection_from_cache(
+    cache: &BTreeMap<String, InterestRegistration>,
+    now_ms: u64,
+    tables: &BTreeSet<TableName>,
+) -> InterestSelection {
+    InterestSelection {
+        interested: interested_nodes_for_tables_from_cache(cache, now_ms, tables),
+        known_nodes: cache.len(),
+        stale_nodes: cache
+            .values()
+            .filter(|registration| !registration.is_fresh(now_ms))
+            .count(),
+    }
 }
 
 impl InterestRegistration {
@@ -223,10 +303,19 @@ mod tests {
     use value::TableName;
 
     use crate::selective_delivery::{
+        interest_selection_from_cache,
         interested_nodes_for_tables_from_cache,
         InterestRegistration,
         SelectiveDeliveryRegistry,
+        INTEREST_MAX_AGE,
     };
+
+    fn registration(tables: &[&str], updated_at_ms: u64) -> InterestRegistration {
+        InterestRegistration {
+            tables: tables.iter().map(ToString::to_string).collect(),
+            updated_at_ms,
+        }
+    }
 
     #[test]
     fn interested_nodes_match_tables_and_skip_stale_entries() {
@@ -265,5 +354,107 @@ mod tests {
             SelectiveDeliveryRegistry::node_subject("node-a"),
             "convex.commits.node.node-a"
         );
+    }
+
+    // --- Issue #133 fail-safe behavior ---------------------------------------
+    //
+    // These assert that a stale, missing, or not-yet-published interest record
+    // never causes a node to be *targeted* (the publisher narrows conservatively).
+    // The matching guarantee that the node still receives the delta lives on the
+    // broadcast path, which `SELECTIVE_DELIVERY_TRUST_INTEREST=false` keeps as
+    // the consumer's source of truth.
+
+    #[test]
+    fn stale_registration_is_skipped_and_counted() {
+        let now_ms = 1_000_000;
+        let stale_at = now_ms - (INTEREST_MAX_AGE.as_millis() as u64) - 1;
+        let messages: TableName = "messages".parse().unwrap();
+        let cache = BTreeMap::from([
+            (
+                "fresh-node".to_string(),
+                registration(&["messages"], now_ms),
+            ),
+            (
+                "stale-node".to_string(),
+                registration(&["messages"], stale_at),
+            ),
+        ]);
+
+        let selection = interest_selection_from_cache(&cache, now_ms, &BTreeSet::from([messages]));
+
+        // The stale node is NOT targeted (it would be missed if targeting were
+        // the only path) and is surfaced as a staleness signal.
+        assert_eq!(selection.interested, vec!["fresh-node".to_string()]);
+        assert_eq!(selection.known_nodes, 2);
+        assert_eq!(selection.stale_nodes, 1);
+    }
+
+    #[test]
+    fn missing_interest_yields_no_targets_and_zero_known() {
+        // A freshly started node that has not published interest yet is simply
+        // absent. Selecting targets must not invent it; the broadcast path is
+        // what actually delivers to it.
+        let now_ms = 1_000_000;
+        let messages: TableName = "messages".parse().unwrap();
+        let cache = BTreeMap::new();
+
+        let selection = interest_selection_from_cache(&cache, now_ms, &BTreeSet::from([messages]));
+
+        assert!(selection.interested.is_empty());
+        assert_eq!(selection.known_nodes, 0);
+        assert_eq!(selection.stale_nodes, 0);
+    }
+
+    #[test]
+    fn delayed_registration_appears_once_published() {
+        let now_ms = 1_000_000;
+        let messages: TableName = "messages".parse().unwrap();
+        let mut cache = BTreeMap::new();
+
+        // Before the node registers: not a target.
+        assert!(interested_nodes_for_tables_from_cache(
+            &cache,
+            now_ms,
+            &BTreeSet::from([messages.clone()])
+        )
+        .is_empty());
+
+        // After it publishes interest: it becomes a target.
+        cache.insert("late-node".to_string(), registration(&["messages"], now_ms));
+        assert_eq!(
+            interested_nodes_for_tables_from_cache(&cache, now_ms, &BTreeSet::from([messages])),
+            vec!["late-node".to_string()]
+        );
+    }
+
+    #[test]
+    fn table_interest_change_updates_targets() {
+        let now_ms = 1_000_000;
+        let messages: TableName = "messages".parse().unwrap();
+        let tasks: TableName = "tasks".parse().unwrap();
+        let mut cache =
+            BTreeMap::from([("node-a".to_string(), registration(&["messages"], now_ms))]);
+
+        // Registered for `messages`, so a `tasks` delta does not target it.
+        assert!(interested_nodes_for_tables_from_cache(
+            &cache,
+            now_ms,
+            &BTreeSet::from([tasks.clone()])
+        )
+        .is_empty());
+
+        // Interest changes to `tasks`: now a `tasks` delta targets it and a
+        // `messages` delta no longer does.
+        cache.insert("node-a".to_string(), registration(&["tasks"], now_ms));
+        assert_eq!(
+            interested_nodes_for_tables_from_cache(&cache, now_ms, &BTreeSet::from([tasks])),
+            vec!["node-a".to_string()]
+        );
+        assert!(interested_nodes_for_tables_from_cache(
+            &cache,
+            now_ms,
+            &BTreeSet::from([messages])
+        )
+        .is_empty());
     }
 }

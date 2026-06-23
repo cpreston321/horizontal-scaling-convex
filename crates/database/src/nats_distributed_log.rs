@@ -608,8 +608,14 @@ impl DistributedLog for NatsDistributedLog {
                 ack.sequence,
             );
         } else if let Some(registry) = &self.selective_registry {
+            // This user-table delta has already gone to the broadcast partition
+            // subject above — the correctness-critical path every node receives
+            // regardless of interest. The node-targeted publishes below are a
+            // best-effort optimization layered on top (issue #133).
+            metrics::log_selective_delivery_broadcast_delta();
             let interested_nodes = registry
-                .interested_nodes_for_tables(&touched_tables)
+                .interested_nodes_with_health(&touched_tables)
+                .interested
                 .into_iter()
                 .filter(|node| node != &self.consumer_name)
                 .collect::<Vec<_>>();

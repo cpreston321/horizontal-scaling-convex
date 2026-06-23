@@ -37,6 +37,7 @@ use common::{
     knobs::{
         ACTION_USER_TIMEOUT,
         DOCUMENT_RETENTION_RATE_LIMIT,
+        SELECTIVE_DELIVERY_TRUST_INTEREST,
         UDF_CACHE_MAX_SIZE,
     },
     persistence::Persistence,
@@ -819,9 +820,29 @@ pub async fn make_app(
         if let Some(nats_url) = &config.nats_url {
             let nats_url = nats_url.clone();
             let committer = database.committer_client();
-            let use_selective_node_targeting = config
+            // Selective node-targeting is a best-effort fanout reduction, not a
+            // correctness-critical delivery path (issue #133). Using it as the
+            // *only* source of cross-partition deltas can silently drop an
+            // invalidation when this node's interest registration is stale,
+            // missing, or lost across a NATS reconnect. So it is opt-in and off
+            // by default; the broadcast partition subjects remain the fail-safe
+            // path that delivers every delta regardless of interest.
+            let use_selective_node_targeting = *SELECTIVE_DELIVERY_TRUST_INTEREST
+                && config
+                    .partition_id
+                    .is_some_and(|local_partition| local_partition != 0);
+            if config
                 .partition_id
-                .is_some_and(|local_partition| local_partition != 0);
+                .is_some_and(|local_partition| local_partition != 0)
+                && !*SELECTIVE_DELIVERY_TRUST_INTEREST
+            {
+                tracing::info!(
+                    "Selective delivery is best-effort only; replica delta consumer uses \
+                     broadcast partition subjects as the correctness-critical path (set \
+                     SELECTIVE_DELIVERY_TRUST_INTEREST=true to opt into selective-only delivery, \
+                     unsafe until #132)"
+                );
+            }
             let remote_partitions = config.partition_id.map(|local_partition| {
                 if let Some(num_partitions) = config.num_partitions {
                     (0..num_partitions)
