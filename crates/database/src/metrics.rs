@@ -325,6 +325,38 @@ pub fn log_selective_delivery_shadow_receive() {
     log_counter(&DATABASE_SELECTIVE_DELIVERY_SHADOW_RECEIVES_TOTAL, 1);
 }
 
+register_convex_histogram!(
+    DATABASE_INVALIDATION_SUBSCRIPTION_SHARDS_TOTAL,
+    "Number of invalidation-ownership shards a subscription registers with (issue #132)"
+);
+register_convex_counter!(
+    DATABASE_INVALIDATION_CROSS_PARTITION_SUBSCRIPTIONS_TOTAL,
+    "Subscriptions whose read set spans more than one invalidation shard"
+);
+/// Record a subscription's invalidation-shard registration fan-out (issue
+/// #132).
+pub fn log_invalidation_registration(num_shards: usize) {
+    log_distribution(
+        &DATABASE_INVALIDATION_SUBSCRIPTION_SHARDS_TOTAL,
+        num_shards as f64,
+    );
+    if num_shards > 1 {
+        log_counter(
+            &DATABASE_INVALIDATION_CROSS_PARTITION_SUBSCRIPTIONS_TOTAL,
+            1,
+        );
+    }
+}
+
+register_convex_counter!(
+    DATABASE_INVALIDATION_CONSERVATIVE_TOTAL,
+    "Conservative (table-level) subscription invalidations fired (issue #132)"
+);
+/// Record that a committed write conservatively invalidated a subscription.
+pub fn log_conservative_invalidation() {
+    log_counter(&DATABASE_INVALIDATION_CONSERVATIVE_TOTAL, 1);
+}
+
 register_convex_gauge!(
     DATABASE_LATEST_REPEATABLE_TS_INFO,
     "Latest repeatable timestamp currently visible on this node"
