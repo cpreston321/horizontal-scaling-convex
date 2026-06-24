@@ -476,6 +476,18 @@ pub async fn coordinate_two_phase_commit(
     };
 
     let participant_indexes = participant_write_indexes(&transaction, partition_map, &write_source);
+    // Resolver-style conflict-check routing (issue #131): map this transaction's
+    // read and write sets to their owning shards and record the fan-out / load.
+    // This is the addressable conflict-ownership layer; 2PC below remains the
+    // commit protocol.
+    crate::conflict_resolver::ConflictPlan::build(
+        transaction.reads.read_set(),
+        &transaction.table_mapping,
+        partition_map,
+        &write_source,
+        &participant_indexes,
+    )
+    .record_metrics();
     let node_addresses = local_committer.node_addresses();
     let participants: Vec<_> = participant_indexes
         .iter()

@@ -15,6 +15,7 @@ pub mod checkpoint;
 pub mod commit_client;
 pub mod commit_delta;
 mod committer;
+pub mod conflict_resolver;
 mod database;
 mod database_index_workers;
 pub mod delta_interest;

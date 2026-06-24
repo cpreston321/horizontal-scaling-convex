@@ -293,27 +293,15 @@ fn remote_read_partitions(
     partition_map: &crate::partition::PartitionMap,
     write_source: &WriteSource,
 ) -> BTreeSet<crate::partition::PartitionId> {
-    let mut partitions = BTreeSet::new();
-    let mut visit_tablet = |tablet_id| {
-        if let Ok(table_name) = table_mapping.tablet_name(tablet_id) {
-            if let Some(partition) = crate::partition::routed_partition_for_table(
-                &table_name,
-                partition_map,
-                write_source,
-            ) && partition != partition_map.local_partition()
-            {
-                partitions.insert(partition);
-            }
-        }
-    };
-
-    for (index_name, _) in reads.iter_indexed() {
-        visit_tablet(*index_name.table());
-    }
-    for (index_name, _) in reads.iter_search() {
-        visit_tablet(*index_name.table());
-    }
-    partitions
+    // Route read-set conflict checking through the resolver layer (issue #131)
+    // so the committer's remote-read-frontier wait and the resolver plan agree
+    // on which partitions own the read set.
+    crate::conflict_resolver::remote_read_conflict_partitions(
+        reads,
+        table_mapping,
+        partition_map,
+        write_source,
+    )
 }
 
 fn stale_replica_frontiers(

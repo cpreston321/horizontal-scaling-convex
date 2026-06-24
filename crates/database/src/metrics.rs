@@ -503,6 +503,39 @@ pub fn log_two_phase_prepare_attempts(num_attempts: usize) {
 }
 
 register_convex_histogram!(
+    DATABASE_CONFLICT_CHECK_SHARDS_TOTAL,
+    "Number of conflict-check shards (owning partitions) a transaction spans (issue #131)"
+);
+register_convex_histogram!(
+    DATABASE_CONFLICT_CHECK_SHARD_WRITES_TOTAL,
+    "Per-shard write-conflict load for a transaction, by owning partition",
+    &PARTITION_LABELS
+);
+register_convex_histogram!(
+    DATABASE_CONFLICT_CHECK_SHARD_READS_TOTAL,
+    "Per-shard read-conflict load (distinct read tables) for a transaction, by owning partition",
+    &PARTITION_LABELS
+);
+/// Record the resolver's conflict-check fan-out and per-shard load for one
+/// transaction (issue #131). `shards` is `(partition, read_tables,
+/// write_count)`.
+pub fn log_conflict_plan(num_shards: usize, shards: &[(PartitionId, usize, usize)]) {
+    log_distribution(&DATABASE_CONFLICT_CHECK_SHARDS_TOTAL, num_shards as f64);
+    for (partition, read_tables, write_count) in shards {
+        log_distribution_with_labels(
+            &DATABASE_CONFLICT_CHECK_SHARD_WRITES_TOTAL,
+            *write_count as f64,
+            vec![partition_label(*partition)],
+        );
+        log_distribution_with_labels(
+            &DATABASE_CONFLICT_CHECK_SHARD_READS_TOTAL,
+            *read_tables as f64,
+            vec![partition_label(*partition)],
+        );
+    }
+}
+
+register_convex_histogram!(
     DATABASE_REPLICATION_TRANSPORT_PUBLISH_SECONDS,
     "Time to publish a replication delta to the distributed log"
 );
