@@ -1,0 +1,17 @@
+[package]
+name = "cluster_sim"
+version = "0.1.0"
+edition = "2024"
+license = "LicenseRef-FSL-1.1-Apache-2.0"
+description = "Deterministic simulation testing for the distributed Convex layer (issue #134)."
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+
+[lints]
+workspace = true
